@@ -1,8 +1,9 @@
 # Feishu_bot_CLI
 Claude Code + Feishu_bot_CLI  GamePlayAgent
-部署在远程linux终端/开发机器上面的Claude Code 对话助手，接入飞书，借助飞书机器人，使用流式卡片，可以帮你审阅提取案子关键信息，艾特人员询问，帮你整理案子思路。
-使用缓存，保留对话session上下文记录，执行更加迅速准确。
-借助Harness Engineering执行平时gm指令发送，查看日志，发送服务器，查看服务器状态操作。解放双手，辅助策划、qa、运营更加了解项目。
+- 部署在远程linux终端/开发机器上面的Claude Code 对话助手  
+- 接入飞书，借助飞书机器人，使用流式卡片，可以帮你审阅提取案子关键信息，艾特人员询问，帮你整理案子思路。  
+- 使用缓存，保留对话session上下文记录，执行更加迅速准确。  
+- 借助Harness Engineering执行平时gm指令发送，查看日志，发送服务器，查看服务器状态操作。解放双手，辅助策划、qa、运营更加了解项目。
 
 # 1. 首先在本地Claude Code 安装FeiShu CLI
 
