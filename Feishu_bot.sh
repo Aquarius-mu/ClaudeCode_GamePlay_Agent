@@ -1,6 +1,6 @@
 #!/bin/bash
 # ══════════════════════════════════════════════════════════
-#  飞书 Claude Bot
+#  飞书 Claude Bot — lark-cli 1.0.7 优化版
 # ══════════════════════════════════════════════════════════
 
 LARK=/home/jiadongsun/nodejs/node22.15/bin/lark-cli
@@ -81,23 +81,33 @@ consume_warmup_session() {
 
 # ══════════════════════════════════════════════════════════
 #  用户名缓存（文件级，子进程共享）
+#  ✅ 使用 --jq 减少一次 jq 进程 fork
 # ══════════════════════════════════════════════════════════
 
 get_sender_name() {
   local sender_id="$1"
+  # 命中缓存直接返回
   local cached
   cached=$(grep "^${sender_id}=" "$NAME_CACHE" 2>/dev/null | head -1 | cut -d= -f2)
   if [[ -n "$cached" ]]; then echo "$cached"; return; fi
+
+  # 未命中，查飞书 API（✅ --jq 直接提取，省一次 jq fork）
   local name
   name=$($LARK contact +get-user \
-    --user-id "$sender_id" --user-id-type open_id \
-    --as user 2>/dev/null | jq -r '.data.user.name // ""') || name=""
-  [[ -z "$name" ]] && name="用户"
+    --user-id "$sender_id" \
+    --user-id-type open_id \
+    --as user \
+    --jq '.data.user.name' \
+    2>/dev/null) || name=""
+  [[ -z "$name" || "$name" == "null" ]] && name="用户"
+
+  # 写缓存
   (
     flock -x 200
     grep -q "^${sender_id}=" "$NAME_CACHE" 2>/dev/null \
       || echo "${sender_id}=${name}" >> "$NAME_CACHE"
   ) 200>"$NAME_CACHE_LOCK"
+
   echo "$name"
 }
 
@@ -133,55 +143,117 @@ session_clear() {
 
 # ══════════════════════════════════════════════════════════
 #  卡片构建
+#  统一 schema:"2.0"；header.template 语义：
+#    grey=进行中  blue=成功回复  green=操作完成  red=错误/拒绝
 # ══════════════════════════════════════════════════════════
 
+# 内部工具：截断长文本
+_truncate() {
+  local s="$1" max="${2:-80}"
+  (( ${#s} > max )) && echo "${s:0:$max}…" || echo "$s"
+}
+
+# 思考中卡片（流式占位）
+# $1=用户名  $2=问题文本
 make_thinking_card() {
-  jq -n --arg name "$1" --arg q "$2" '{
+  local q; q=$(_truncate "$2")
+  jq -n --arg name "$1" --arg q "$q" '{
     schema:"2.0",
     header:{title:{tag:"plain_text",content:("💬 "+$name+" 问")},template:"grey"},
     config:{streaming_mode:true},
-    body:{elements:[{tag:"markdown",content:("> "+$q+"\n\n⏳ 思考中...")}]}
+    body:{elements:[
+      {tag:"markdown",content:("> "+$q)},
+      {tag:"hr"},
+      {tag:"markdown",content:"⏳ **思考中…**"}
+    ]}
   }'
 }
 
+# 回复卡片（最终结果）
+# $1=用户名  $2=问题预览  $3=回答  $4=耗时
 make_reply_card() {
-  jq -n --arg name "$1" --arg answer "$2" --arg dur "$3" '{
+  local q; q=$(_truncate "$2")
+  jq -n --arg name "$1" --arg q "$q" --arg answer "$3" --arg dur "$4" '{
     schema:"2.0",
     header:{title:{tag:"plain_text",content:("💬 "+$name+" 问")},template:"blue"},
     config:{streaming_mode:false},
-    body:{elements:[{tag:"markdown",content:($answer+"\n\n---\n✅ 耗时 **"+$dur+"**")}]}
+    body:{elements:[
+      {tag:"markdown",content:("> "+$q)},
+      {tag:"hr"},
+      {tag:"markdown",content:$answer},
+      {tag:"hr"},
+      {tag:"markdown",content:("✅ 耗时 **"+$dur+"**")}
+    ]}
   }'
 }
 
+# 错误卡片
+# $1=错误信息（可选）  $2=建议操作（可选）
 make_error_card() {
-  jq -n --arg msg "${1:-抱歉，我暂时无法回答，请稍后再试。}" '{
+  local msg="${1:-抱歉，我暂时无法回答，请稍后再试。}"
+  local hint="${2:-}"
+  local content="$msg"
+  [[ -n "$hint" ]] && content+="\\n\\n💡 _${hint}_"
+  jq -n --arg content "$content" '{
     schema:"2.0",
     header:{title:{tag:"plain_text",content:"❌ 出错了"},template:"red"},
     config:{streaming_mode:false},
-    body:{elements:[{tag:"markdown",content:$msg}]}
+    body:{elements:[{tag:"markdown",content:$content}]}
   }'
 }
 
+# 权限不足卡片
 make_noperm_card() {
   jq -n '{
     schema:"2.0",
     header:{title:{tag:"plain_text",content:"⛔ 权限不足"},template:"red"},
     config:{streaming_mode:false},
-    body:{elements:[{tag:"markdown",content:"抱歉，你没有对应权限。"}]}
+    body:{elements:[{tag:"markdown",content:"抱歉，你没有使用该 Bot 的权限。"}]}
+  }'
+}
+
+# 操作成功卡片（用于指令反馈）
+# $1=标题  $2=内容
+make_success_card() {
+  jq -n --arg title "$1" --arg content "$2" '{
+    schema:"2.0",
+    header:{title:{tag:"plain_text",content:$title},template:"green"},
+    config:{streaming_mode:false},
+    body:{elements:[{tag:"markdown",content:$content}]}
+  }'
+}
+
+# 帮助卡片（/help 指令）
+make_help_card() {
+  jq -n '{
+    schema:"2.0",
+    header:{title:{tag:"plain_text",content:"📖 使用帮助"},template:"blue"},
+    config:{streaming_mode:false},
+    body:{elements:[
+      {tag:"markdown",content:"**可用指令**"},
+      {tag:"markdown",content:"| 指令 | 说明 |\n|------|------|\n| `/clear` 或 `清除记忆` | 清除当前会话历史，开启新对话 |\n| `/help` 或 `帮助` | 显示本帮助 |"},
+      {tag:"hr"},
+      {tag:"markdown",content:"直接发送消息即可与 Claude 对话，**@Bot** 触发。"}
+    ]}
   }'
 }
 
 # ══════════════════════════════════════════════════════════
 #  卡片发送 / 更新
+#  ✅ send_card 使用 --jq 提取 message_id
 # ══════════════════════════════════════════════════════════
 
 send_card() {
   local t0; t0=$(now_ms)
   local result
+  # ✅ --jq 直接输出 message_id，省一次 jq fork
   result=$($LARK im +messages-reply \
-    --message-id "$1" --msg-type interactive \
+    --message-id "$1" \
+    --msg-type interactive \
     --content "$(printf '%s' "$2" | jq -c .)" \
-    --as bot 2>/dev/null | jq -r '.data.message_id // empty')
+    --as bot \
+    --jq '.data.message_id' \
+    2>/dev/null)
   log "send_card: $(format_duration $(( $(now_ms)-t0 )))"
   echo "$result"
 }
@@ -193,7 +265,9 @@ update_card() {
   payload=$(jq -n --argjson card "$2" \
     '{"msg_type":"interactive","content":($card|tojson)}')
   $LARK api PATCH "/open-apis/im/v1/messages/${1}" \
-    --data "$payload" --as bot 2>/dev/null
+    --data "$payload" \
+    --as bot \
+    2>/dev/null
   log "update_card: $(format_duration $(( $(now_ms)-t0 )))"
 }
 
@@ -216,7 +290,7 @@ _new_session() {
 # ══════════════════════════════════════════════════════════
 #  Claude 调用
 #  · 系统提示词只在建立 session 时注入一次
-#  · resume 时不传 --system-prompt
+#  · resume 时不传 --system-prompt（避免冲突）
 #  · 不传 --max-turns（会显著增加耗时）
 # ══════════════════════════════════════════════════════════
 
@@ -236,7 +310,7 @@ call_claude() {
       session_id=$(_new_session)
       log "claude: 临时建立完成 ($(format_duration $(( $(now_ms)-t0 )))) sid=${session_id:0:8}..."
     fi
-    # 立刻补充下一个预建session
+    # 立刻补充下一个预建 session
     build_warmup_session &
   fi
 
@@ -293,21 +367,19 @@ handle_message() {
   case "$question" in
     /clear|清除记忆)
       session_clear "$chat_id"
-      send_card "$message_id" "$(jq -n '{
-        schema:"2.0",
-        header:{title:{tag:"plain_text",content:"🗑️ 已清除"},template:"green"},
-        config:{streaming_mode:false},
-        body:{elements:[{tag:"markdown",
-          content:"对话历史已清除，下一条消息将开启新会话。"}]}
-      }')" >/dev/null
+      send_card "$message_id" \
+        "$(make_success_card "🗑️ 已清除" "对话历史已清除，下一条消息将开启新会话。")" >/dev/null
       build_warmup_session &
+      return ;;
+    /help|帮助)
+      send_card "$message_id" "$(make_help_card)" >/dev/null
       return ;;
   esac
 
   # 读会话
   local session_id; session_id=$(session_get "$chat_id")
 
-  # 查用户名缓存
+  # 查用户名缓存（有缓存则 <1ms）
   local sender_name
   sender_name=$(grep "^${sender_id}=" "$NAME_CACHE" 2>/dev/null \
     | head -1 | cut -d= -f2)
@@ -321,6 +393,9 @@ handle_message() {
   local tmp_name;   tmp_name=$(mktemp   "$BOT_DIR/.name.XXXXXX")
   echo "$sender_name" > "$tmp_name"
 
+  # ★ 保证退出时清理临时文件
+  trap "rm -f '$tmp_mid' '$tmp_claude' '$tmp_name'" EXIT
+  
   # 并行1：发"思考中"卡片
   (
     local card mid
@@ -335,16 +410,8 @@ handle_message() {
   if ! grep -q "^${sender_id}=" "$NAME_CACHE" 2>/dev/null; then
     (
       local name
-      name=$($LARK contact +get-user \
-        --user-id "$sender_id" --user-id-type open_id \
-        --as user 2>/dev/null | jq -r '.data.user.name // ""') || name=""
-      [[ -z "$name" ]] && name="用户"
+      name=$(get_sender_name "$sender_id")
       echo "$name" > "$tmp_name"
-      (
-        flock -x 200
-        grep -q "^${sender_id}=" "$NAME_CACHE" 2>/dev/null \
-          || echo "${sender_id}=${name}" >> "$NAME_CACHE"
-      ) 200>"$NAME_CACHE_LOCK"
     ) &
     name_pid=$!
   fi
@@ -354,7 +421,7 @@ handle_message() {
   call_claude "$question" "$session_id" "$tmp_claude"
   log "Claude耗时: $(format_duration $(( $(now_ms)-call_start )))"
 
-  # 等待并行任务
+  # 等待并行任务完成
   wait "$card_pid"
   [[ -n "$name_pid" ]] && wait "$name_pid"
 
@@ -365,7 +432,7 @@ handle_message() {
 
   rm -f "$tmp_mid" "$tmp_claude" "$tmp_name"
 
-  [[ -n "$real_name" ]] && sender_name="$real_name"
+  [[ -n "$real_name" && "$real_name" != "用户" ]] && sender_name="$real_name"
   [[ -n "$result_sid" ]] && session_set "$chat_id" "$result_sid"
 
   local total_ms=$(( $(now_ms)-start_ms ))
@@ -374,9 +441,9 @@ handle_message() {
 
   local final_card
   if [[ -z "$result_text" ]]; then
-    final_card=$(make_error_card)
+    final_card=$(make_error_card "" "可发送 /clear 重置会话后重试")
   else
-    final_card=$(make_reply_card "$sender_name" "$result_text" "$duration")
+    final_card=$(make_reply_card "$sender_name" "$question" "$result_text" "$duration")
   fi
 
   if [[ -n "$reply_msg_id" ]]; then
@@ -407,15 +474,18 @@ event_loop() {
 
     while IFS= read -r line; do
 
-      chat_id=$(printf '%s' "$line" | jq -r '.event.message.chat_id // empty' 2>/dev/null)
+      chat_id=$(printf '%s' "$line" | \
+        jq -r '.event.message.chat_id // empty' 2>/dev/null)
       [[ -z "$chat_id" ]] && continue
 
       has_bot=$(printf '%s' "$line" | jq -r --arg oid "$BOT_OPEN_ID" \
         '[.event.message.mentions[]? | select(.id.open_id==$oid)] | length' 2>/dev/null)
       [[ "$has_bot" -lt 1 ]] && continue
 
-      message_id=$(printf '%s' "$line" | jq -r '.event.message.message_id // empty' 2>/dev/null)
-      sender_id=$(printf '%s'  "$line" | jq -r '.event.sender.sender_id.open_id // empty' 2>/dev/null)
+      message_id=$(printf '%s' "$line" | \
+        jq -r '.event.message.message_id // empty' 2>/dev/null)
+      sender_id=$(printf '%s' "$line" | \
+        jq -r '.event.sender.sender_id.open_id // empty' 2>/dev/null)
       [[ -z "$message_id" ]] && continue
 
       [[ -n "${processed_ids[$message_id]+x}" ]] && continue
@@ -426,7 +496,8 @@ event_loop() {
         continue
       fi
 
-      raw=$(printf '%s' "$line" | jq -r '.event.message.content // "{}"' 2>/dev/null)
+      raw=$(printf '%s' "$line" | \
+        jq -r '.event.message.content // "{}"' 2>/dev/null)
       question=$(printf '%s' "$raw" | jq -r '.text // ""' 2>/dev/null \
         | sed 's/@[^ ]*//g; s/^[[:space:]]*//; s/[[:space:]]*$//')
       [[ -z "$question" ]] && continue
