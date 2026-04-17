@@ -1,33 +1,120 @@
-# Feishu_bot_CLI
-Claude Code + Feishu_bot_CLI  GamePlayAgent
-- 部署在远程linux终端/开发机器上面的Claude Code 对话助手  
-- 接入飞书，借助飞书机器人，使用流式卡片，可以帮你审阅提取案子关键信息，艾特人员询问，帮你整理案子思路。  
-- 使用缓存，保留对话session上下文记录，执行更加迅速准确。  
-- 借助Harness Engineering执行平时gm指令发送，查看日志，发送服务器，查看服务器状态操作。解放双手，辅助策划、qa、运营更加了解项目。
+## 架构                                                                                                                                                                      
+                                                                                                                                                                            
+飞书群消息                                                                                                                                                                   
+    → lark-cli event +subscribe（事件监听）                 
+    → lark_sweet_bot.sh（消息过滤 / 会话管理）                                                                                                                                 
+    → claude CLI --resume（带上下文调用 Claude）                                                                                                                               
+    → lark-cli im +messages-send（发卡片回复）                                                                                                                                 
+                                                                                                                                                                            
+Claude 具备三个 Skill，对话结束后异步自我改进：                                                                                                                              
+- **feishu-lark-cli**：lark-cli 完整操作指南                                                                                                                                 
+- **feishu-cache**：缓存读写规范                                                                                                                                             
+- **feishu-file-ops**：文件操作安全规范                                                                                                                                      
+                                                                                                                                                                            
+## 前置依赖                                                                                                                                                                  
+                                                                                                                                                                            
+| 依赖 | 版本 | 说明 |                                                                                                                                                       
+|------|------|------|                                    
+| [Claude Code CLI](https://github.com/anthropics/claude-code) | 最新 | `claude` 命令 |                                                                                      
+| [lark-cli](https://github.com/larksuite/cli) | ≥ 1.0.7 | 飞书 API 命令行工具 |                                                                                             
+| `jq` | ≥ 1.6 | JSON 处理 |                                                                                                                                                 
+| `flock` | 系统自带 | 并发锁（Linux util-linux） |                                                                                                                          
+| `python3` | ≥ 3.6 | 构建卡片 JSON |                                                                                                                                        
+                                                                                                                                                                            
+## 飞书应用配置                                                                                                                                                              
+                                                                                                                                                                            
+1. 在[飞书开放平台](https://open.feishu.cn)创建自建应用                                                                                                                      
+2. 开启以下权限：                                         
+    - `im:message`（收发消息）                                                                                                                                                
+    - `im:chat`（读取群信息）                                                                                                                                                 
+    - `contact:user.base:readonly`（查询用户信息）                                                                                                                            
+    - `wiki:wiki:readonly`（读知识库，可选）                                                                                                                                  
+    - `sheets:spreadsheet:readonly`（读表格，可选）                                                                                                                           
+    - `bitable:app:readonly`（读多维表格，可选）                                                                                                                              
+3. 订阅事件：`im.message.receive_v1`                                                                                                                                         
+4. 记录应用的 **App ID** 和 **App Secret**                                                                                                                                   
+                                                                                                                                                                            
+## 安装                                                                                                                                                                      
+                                                                                                                                                                            
+```bash                                                                                                                                                                      
+# 1. 克隆仓库                                             
+git clone <repo_url>                                                                                                                                                         
+cd <repo>                                                                                                                                                                    
+                                                                                                                                                                            
+# 2. 安装 lark-cli                                                                                                                                                           
+npm install -g @larksuiteoapi/lark-cli   # 或参考官方文档                                                                                                                    
+                                                                                                                                                                            
+# 3. 配置 lark-cli（user 和 bot 两个身份都要登录）                                                                                                                           
+lark-cli auth login --as user                                                                                                                                                
+lark-cli auth login --as bot                                                                                                                                                 
+                                                            
+# 4. 安装 Claude Code CLI                                                                                                                                                    
+# 参考 https://github.com/anthropics/claude-code          
+                                                                                                                                                                            
+# 5. 安装 Skills（复制到 Claude 配置目录）                                                                                                                                   
+cp -r skills/feishu-lark-cli  ~/.claude/skills/
+cp -r skills/feishu-cache     ~/.claude/skills/                                                                                                                              
+cp -r skills/feishu-file-ops  ~/.claude/skills/           
+                                                                                                                                                                            
+配置脚本
+                                                                                                                                                                            
+编辑 lark_sweet_bot.sh 顶部的以下变量：                   
 
-# 1. 首先在本地Claude Code 安装FeiShu CLI
+# lark-cli 可执行路径（which lark-cli 查看）
+LARK=/path/to/lark-cli                                                                                                                                                       
 
-# 2. 在Claude Code 本地运行脚本
-bash Feishu_bot.sh start
+# Bot 的 open_id（在飞书开放平台「应用信息」页查看机器人的 open_id）                                                                                                         
+BOT_OPEN_ID=ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx           
+                                                                                                                                                                            
+# 允许使用 Bot 的用户 open_id（目前只支持单个用户）       
+# 用 lark-cli contact +search-user --query "姓名" --as user 查询                                                                                                             
+ALLOWED_SENDER=ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx                                                                                                                           
 
-# 3. Harness Engineering
-主要由.claude 下面 CLAUDE.md, skills, mcp-servers 驱动
-这里由于涉及了项目隐秘信息就不保存了
+# Claude Code CLI 的 MCP 配置文件路径                                                                                                                                        
+MCP_CONFIG=/path/to/.claude/mcp.json                      
+                                                                                                                                                                            
+启动                                                                                                                                                                         
+                                                                                                                                                                            
+chmod +x lark_sweet_bot.sh                                                                                                                                                   
+                                                                                                                                                                            
+# 启动（后台 daemon）                                                                                                                                                        
+./lark_sweet_bot.sh start                                                                                                                                                    
+                                                                                                                                                                            
+# 查看状态                                                                                                                                                                   
+./lark_sweet_bot.sh status                                                                                                                                                   
+                                                                                                                                                                            
+# 查看日志                                                                                                                                                                   
+tail -f ~/feishu_bot/bot.log
+                                                                                                                                                                            
+# 停止 / 重启                                                                                                                                                                
+./lark_sweet_bot.sh stop                                                                                                                                                     
+./lark_sweet_bot.sh restart                                                                                                                                                  
+                                                                                                                                                                            
+在群里使用                                                                                                                                                                   
+                                                                                                                                                                            
+- @ Bot + 消息：与 Claude 对话，支持多轮上下文                                                                                                                               
+- /clear 或发送清除记忆：清除当前群的对话历史             
+- /help 或发送帮助：显示使用说明                                                                                                                                             
+                                                                                                                                                                            
+缓存目录结构                                                                                                                                                                 
+                                                                                                                                                                            
+~/feishu_bot/                                                                                                                                                                
+├── cache/                                                                                                                                                                   
+│   ├── tokens.json   # spreadsheet / bitable / wiki token
+│   ├── groups.json   # 群组信息（chat_id + 群名）                                                                                                                           
+│   └── users.json    # 用户信息（open_id + 姓名/邮箱/部门）                                                                                                                 
+├── name_cache        # open_id=姓名，脚本自动维护                                                                                                                           
+├── group_cache       # chat_id=群名，脚本自动维护                                                                                                                           
+├── sessions          # 各群的 Claude session_id                                                                                                                             
+├── bot.log           # 运行日志                                                                                                                                             
+└── skill_improve.log # Skill 自动改进日志                                                                                                                                   
+                                                                                                                                                                            
+权限控制                                                                                                                                                                     
+                                                            
+当前版本通过 ALLOWED_SENDER 白名单控制访问，只有指定用户 @ Bot 才会响应，其他人收到「权限不足」提示。                                                                        
 
-# 4. 运行效果
-## 1. 读取飞书案子，自动询问策划补充需求
-<img width="1352" height="220" alt="image" src="https://github.com/user-attachments/assets/8b9ed0c6-935a-4d91-aae9-89f3e16cebd8" />
-
-## 2. 读取飞书表格，自动化发版本艾特相关人员，缓存sessionid,保留上下文记忆
-<img width="935" height="536" alt="image" src="https://github.com/user-attachments/assets/8038182b-2d58-4314-b1f9-2adab9366ac2" />
-<img width="751" height="297" alt="image" src="https://github.com/user-attachments/assets/94c2ffcc-f92b-4921-88c0-137f90458790" />
-
-## 3. 辅助策划，测试执行gm指令，发放最新服务器
-<img width="682" height="186" alt="image" src="https://github.com/user-attachments/assets/52585757-d2d6-4f97-bca6-1abce36c496c" />
-<img width="868" height="238" alt="image" src="https://github.com/user-attachments/assets/6bf96d60-b69c-482d-b476-13f79b6558bf" />
-<img width="690" height="187" alt="image" src="https://github.com/user-attachments/assets/e28d7495-95f3-44de-bd72-bcc85f596f1b" />
-
-## 4. 远程书写代码，帮你执行操作
-<img width="811" height="505" alt="image" src="https://github.com/user-attachments/assets/fc7bd974-8c36-47b4-9087-59dec7d5b0d5" />
-
-
+注意事项                                                                                                                                                                     
+                                                            
+- MCP_CONFIG 需包含 lark-cli 相关 MCP server 配置，Claude 才能调用飞书工具                                                                                                   
+- Bot 使用 --dangerously-skip-permissions 启动 Claude，请确保运行环境安全，不要在公网服务器上直接暴露
+- Skill 自动改进功能会在对话结束后异步调用 Claude，不影响响应速度，日志写入 skill_improve.log    
