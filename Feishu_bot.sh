@@ -1,6 +1,6 @@
 #!/bin/bash
 # ══════════════════════════════════════════════════════════
-#  飞书 Claude Bot — lark-cli 1.0.7 优化版
+#  飞书 Claude Bot — lark-cli 1.0.7
 # ══════════════════════════════════════════════════════════
 
 LARK=/home/jiadongsun/nodejs/node22.15/bin/lark-cli
@@ -11,17 +11,27 @@ SESSION_FILE="$BOT_DIR/sessions"
 SESSION_LOCK="$BOT_DIR/sessions.lock"
 NAME_CACHE="$BOT_DIR/name_cache"
 NAME_CACHE_LOCK="$BOT_DIR/name_cache.lock"
+GROUP_CACHE="$BOT_DIR/group_cache"
+GROUP_CACHE_LOCK="$BOT_DIR/group_cache.lock"
 WARMUP_SESSION="$BOT_DIR/warmup_session"
 WARMUP_LOCK="$BOT_DIR/warmup_session.lock"
+CACHE_DIR="$BOT_DIR/cache"
+SKILL_IMPROVE_LOG="$BOT_DIR/skill_improve.log"
+SKILL_IMPROVE_LOCK="$BOT_DIR/skill_improve.lock"
 PID_FILE="$BOT_DIR/bot.pid"
 LOG_FILE="$BOT_DIR/bot.log"
 
 CLAUDE_BIN=claude
 MCP_CONFIG=/data/home/jiadongsun/.claude/mcp.json
 
-SYSTEM_PROMPT="你是一个对话助手。请直接回答用户的问题。只有当用户明确要求查询、搜索或执行某个操作时，才考虑使用工具；普通对话、问候、知识问答等请直接回答，不要主动调用任何工具。"
+SYSTEM_PROMPT="你是一个飞书群助手。每条用户消息开头会携带[系统上下文]，\
+包含当前群组名称、chat_id、发送者姓名和 open_id，\
+你可以直接使用这些 ID 调用 lark-cli 操作飞书。\
+请直接回答用户问题。只有当用户明确要求查询、搜索或执行操作时，\
+才考虑使用工具；普通对话、问候、知识问答等请直接回答，不要主动调用任何工具。"
 
 mkdir -p "$BOT_DIR"
+mkdir -p "$CACHE_DIR"
 
 # ══════════════════════════════════════════════════════════
 #  工具函数
@@ -80,18 +90,16 @@ consume_warmup_session() {
 }
 
 # ══════════════════════════════════════════════════════════
-#  用户名缓存（文件级，子进程共享）
-#  ✅ 使用 --jq 减少一次 jq 进程 fork
+#  用户名缓存
 # ══════════════════════════════════════════════════════════
 
 get_sender_name() {
   local sender_id="$1"
-  # 命中缓存直接返回
+
   local cached
   cached=$(grep "^${sender_id}=" "$NAME_CACHE" 2>/dev/null | head -1 | cut -d= -f2)
   if [[ -n "$cached" ]]; then echo "$cached"; return; fi
 
-  # 未命中，查飞书 API（✅ --jq 直接提取，省一次 jq fork）
   local name
   name=$($LARK contact +get-user \
     --user-id "$sender_id" \
@@ -101,14 +109,100 @@ get_sender_name() {
     2>/dev/null) || name=""
   [[ -z "$name" || "$name" == "null" ]] && name="用户"
 
-  # 写缓存
   (
     flock -x 200
     grep -q "^${sender_id}=" "$NAME_CACHE" 2>/dev/null \
       || echo "${sender_id}=${name}" >> "$NAME_CACHE"
   ) 200>"$NAME_CACHE_LOCK"
 
+  _write_users_json "$sender_id" "$name" &
+
   echo "$name"
+}
+
+_write_users_json() {
+  local open_id="$1" name="$2"
+  local cache="$CACHE_DIR/users.json" lock="$CACHE_DIR/users.lock"
+  local now; now=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+  (
+    flock -x 200
+    local cur; cur=$(cat "$cache" 2>/dev/null)
+    echo "$cur" | jq empty 2>/dev/null || cur="{}"
+    echo "$cur" | jq \
+      --arg id "$open_id" --arg n "$name" --arg ts "$now" \
+      'if .[$id] == null then .[$id] = {"name":$n,"updated_at":$ts} else . end' \
+      > "${cache}.tmp" \
+    && jq empty "${cache}.tmp" 2>/dev/null \
+    && mv "${cache}.tmp" "$cache"
+  ) 200>"$lock"
+}
+
+# ══════════════════════════════════════════════════════════
+#  群名缓存
+# ══════════════════════════════════════════════════════════
+
+get_group_name() {
+  local chat_id="$1"
+
+  local cached
+  cached=$(grep "^${chat_id}=" "$GROUP_CACHE" 2>/dev/null | head -1 | cut -d= -f2)
+  if [[ -n "$cached" ]]; then echo "$cached"; return; fi
+
+  local name
+  name=$($LARK im +chats-get \
+    --chat-id "$chat_id" \
+    --as bot \
+    --jq '.data.chat.name' \
+    2>/dev/null) || name=""
+  [[ -z "$name" || "$name" == "null" ]] && name="未知群组"
+
+  (
+    flock -x 200
+    grep -q "^${chat_id}=" "$GROUP_CACHE" 2>/dev/null \
+      || echo "${chat_id}=${name}" >> "$GROUP_CACHE"
+  ) 200>"$GROUP_CACHE_LOCK"
+
+  _write_groups_json "$chat_id" "$name" &
+
+  echo "$name"
+}
+
+_write_groups_json() {
+  local chat_id="$1" name="$2"
+  local cache="$CACHE_DIR/groups.json" lock="$CACHE_DIR/groups.lock"
+  local now; now=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+  (
+    flock -x 200
+    local cur; cur=$(cat "$cache" 2>/dev/null)
+    echo "$cur" | jq empty 2>/dev/null || cur="{}"
+    echo "$cur" | jq \
+      --arg id "$chat_id" --arg n "$name" --arg ts "$now" \
+      '.[$id] = ((.[$id] // {}) + {"name":$n,"updated_at":$ts})' \
+      > "${cache}.tmp" \
+    && jq empty "${cache}.tmp" 2>/dev/null \
+    && mv "${cache}.tmp" "$cache"
+  ) 200>"$lock"
+}
+
+# ══════════════════════════════════════════════════════════
+#  构建注入给 Claude 的上下文头
+# ══════════════════════════════════════════════════════════
+
+build_context_header() {
+  local chat_id="$1"
+  local sender_id="$2"
+  local sender_name="$3"
+  local group_name="${4:-未知群组}"
+  local now
+  now=$(date '+%Y-%m-%d %H:%M:%S')
+
+  cat <<EOF
+[系统上下文 - 当前对话信息]
+时间: ${now}
+群组: ${group_name}（chat_id: ${chat_id}）
+发送者: ${sender_name}（open_id: ${sender_id}）
+---
+EOF
 }
 
 # ══════════════════════════════════════════════════════════
@@ -143,18 +237,13 @@ session_clear() {
 
 # ══════════════════════════════════════════════════════════
 #  卡片构建
-#  统一 schema:"2.0"；header.template 语义：
-#    grey=进行中  blue=成功回复  green=操作完成  red=错误/拒绝
 # ══════════════════════════════════════════════════════════
 
-# 内部工具：截断长文本
 _truncate() {
   local s="$1" max="${2:-80}"
   (( ${#s} > max )) && echo "${s:0:$max}…" || echo "$s"
 }
 
-# 思考中卡片（流式占位）
-# $1=用户名  $2=问题文本
 make_thinking_card() {
   local q; q=$(_truncate "$2")
   jq -n --arg name "$1" --arg q "$q" '{
@@ -169,8 +258,6 @@ make_thinking_card() {
   }'
 }
 
-# 回复卡片（最终结果）
-# $1=用户名  $2=问题预览  $3=回答  $4=耗时
 make_reply_card() {
   local q; q=$(_truncate "$2")
   jq -n --arg name "$1" --arg q "$q" --arg answer "$3" --arg dur "$4" '{
@@ -187,8 +274,6 @@ make_reply_card() {
   }'
 }
 
-# 错误卡片
-# $1=错误信息（可选）  $2=建议操作（可选）
 make_error_card() {
   local msg="${1:-抱歉，我暂时无法回答，请稍后再试。}"
   local hint="${2:-}"
@@ -202,7 +287,6 @@ make_error_card() {
   }'
 }
 
-# 权限不足卡片
 make_noperm_card() {
   jq -n '{
     schema:"2.0",
@@ -212,8 +296,6 @@ make_noperm_card() {
   }'
 }
 
-# 操作成功卡片（用于指令反馈）
-# $1=标题  $2=内容
 make_success_card() {
   jq -n --arg title "$1" --arg content "$2" '{
     schema:"2.0",
@@ -223,7 +305,6 @@ make_success_card() {
   }'
 }
 
-# 帮助卡片（/help 指令）
 make_help_card() {
   jq -n '{
     schema:"2.0",
@@ -240,13 +321,11 @@ make_help_card() {
 
 # ══════════════════════════════════════════════════════════
 #  卡片发送 / 更新
-#  ✅ send_card 使用 --jq 提取 message_id
 # ══════════════════════════════════════════════════════════
 
 send_card() {
   local t0; t0=$(now_ms)
   local result
-  # ✅ --jq 直接输出 message_id，省一次 jq fork
   result=$($LARK im +messages-reply \
     --message-id "$1" \
     --msg-type interactive \
@@ -272,7 +351,7 @@ update_card() {
 }
 
 # ══════════════════════════════════════════════════════════
-#  建立新 Session（带系统提示词）
+#  建立新 Session
 # ══════════════════════════════════════════════════════════
 
 _new_session() {
@@ -289,9 +368,6 @@ _new_session() {
 
 # ══════════════════════════════════════════════════════════
 #  Claude 调用
-#  · 系统提示词只在建立 session 时注入一次
-#  · resume 时不传 --system-prompt（避免冲突）
-#  · 不传 --max-turns（会显著增加耗时）
 # ══════════════════════════════════════════════════════════
 
 call_claude() {
@@ -299,7 +375,6 @@ call_claude() {
   local session_id="$2"
   local out_file="$3"
 
-  # 无 session 时取预建的（或临时建立）
   if [[ -z "$session_id" ]]; then
     session_id=$(consume_warmup_session)
     if [[ -n "$session_id" ]]; then
@@ -310,7 +385,6 @@ call_claude() {
       session_id=$(_new_session)
       log "claude: 临时建立完成 ($(format_duration $(( $(now_ms)-t0 )))) sid=${session_id:0:8}..."
     fi
-    # 立刻补充下一个预建 session
     build_warmup_session &
   fi
 
@@ -320,7 +394,6 @@ call_claude() {
     return
   fi
 
-  # Resume 极速调用
   log "claude: resume sid=${session_id:0:8}..."
   local t0; t0=$(now_ms)
 
@@ -334,7 +407,6 @@ call_claude() {
 
   log "claude: $(format_duration $(( $(now_ms)-t0 ))) chars=${#text}"
 
-  # Resume 失败（空输出）时自动重建
   if [[ -z "$text" ]]; then
     log "claude: resume失败(sid=${session_id:0:8})，重建session..."
     local new_sid; new_sid=$(_new_session)
@@ -376,26 +448,31 @@ handle_message() {
       return ;;
   esac
 
-  # 读会话
   local session_id; session_id=$(session_get "$chat_id")
 
-  # 查用户名缓存（有缓存则 <1ms）
+  # 读用户名缓存（有则 <1ms）
   local sender_name
   sender_name=$(grep "^${sender_id}=" "$NAME_CACHE" 2>/dev/null \
     | head -1 | cut -d= -f2)
   [[ -z "$sender_name" ]] && sender_name="用户"
 
-  log "收到 [$sender_name]$([ -n "$session_id" ] && echo "(续)" || echo "(首次)"): ${question:0:80}"
+  # 读群名缓存（有则 <1ms）
+  local group_name
+  group_name=$(grep "^${chat_id}=" "$GROUP_CACHE" 2>/dev/null \
+    | head -1 | cut -d= -f2)
+  [[ -z "$group_name" ]] && group_name="未知群组"
 
-  # 临时文件（并行子进程间传递结果）
+  log "收到 [${group_name}][${sender_name}]$(
+    [ -n "$session_id" ] && echo "(续)" || echo "(首次)"
+  ): ${question:0:80}"
+
   local tmp_mid;    tmp_mid=$(mktemp    "$BOT_DIR/.mid.XXXXXX")
   local tmp_claude; tmp_claude=$(mktemp "$BOT_DIR/.claude.XXXXXX")
   local tmp_name;   tmp_name=$(mktemp   "$BOT_DIR/.name.XXXXXX")
   echo "$sender_name" > "$tmp_name"
 
-  # ★ 保证退出时清理临时文件
   trap "rm -f '$tmp_mid' '$tmp_claude' '$tmp_name'" EXIT
-  
+
   # 并行1：发"思考中"卡片
   (
     local card mid
@@ -405,28 +482,40 @@ handle_message() {
   ) &
   local card_pid=$!
 
-  # 并行2：首次查用户名（有缓存则跳过）
+  # 并行2：异步补全用户名（有缓存则跳过）
   local name_pid=""
   if ! grep -q "^${sender_id}=" "$NAME_CACHE" 2>/dev/null; then
     (
-      local name
-      name=$(get_sender_name "$sender_id")
+      local name; name=$(get_sender_name "$sender_id")
       echo "$name" > "$tmp_name"
     ) &
     name_pid=$!
   fi
 
+  # 并行3：异步拉取群名（有缓存则跳过）
+  local group_pid=""
+  if ! grep -q "^${chat_id}=" "$GROUP_CACHE" 2>/dev/null; then
+    ( get_group_name "$chat_id" > /dev/null ) &
+    group_pid=$!
+  fi
+
+  # 构建注入上下文的完整 prompt
+  local context_header
+  context_header=$(build_context_header \
+    "$chat_id" "$sender_id" "$sender_name" "$group_name")
+  local full_prompt="${context_header}${question}"
+
   # 主线程：调用 Claude（与上面并行）
   local call_start; call_start=$(now_ms)
-  call_claude "$question" "$session_id" "$tmp_claude"
+  call_claude "$full_prompt" "$session_id" "$tmp_claude"
   log "Claude耗时: $(format_duration $(( $(now_ms)-call_start )))"
 
-  # 等待并行任务完成
   wait "$card_pid"
-  [[ -n "$name_pid" ]] && wait "$name_pid"
+  [[ -n "$name_pid"  ]] && wait "$name_pid"
+  [[ -n "$group_pid" ]] && wait "$group_pid"
 
-  local reply_msg_id; reply_msg_id=$(cat "$tmp_mid"  2>/dev/null)
-  local real_name;    real_name=$(cat    "$tmp_name" 2>/dev/null)
+  local reply_msg_id; reply_msg_id=$(cat "$tmp_mid"   2>/dev/null)
+  local real_name;    real_name=$(cat    "$tmp_name"  2>/dev/null)
   local result_text;  result_text=$(jq -r '.text // empty'       "$tmp_claude" 2>/dev/null)
   local result_sid;   result_sid=$(jq -r  '.session_id // empty' "$tmp_claude" 2>/dev/null)
 
@@ -437,7 +526,7 @@ handle_message() {
 
   local total_ms=$(( $(now_ms)-start_ms ))
   local duration; duration=$(format_duration "$total_ms")
-  log "完成 [$sender_name] ${#result_text}字 总耗时${duration}"
+  log "完成 [${group_name}][${sender_name}] ${#result_text}字 总耗时${duration}"
 
   local final_card
   if [[ -z "$result_text" ]]; then
@@ -451,6 +540,128 @@ handle_message() {
   else
     send_card "$message_id" "$final_card" >/dev/null
   fi
+
+  # 发送完成后异步改进 Skill（不阻塞主流程）
+  trigger_skill_improve "$question" "$result_text"
+}
+
+# ══════════════════════════════════════════════════════════
+#  异步 Skill 改进（发送后后台触发，不影响响应速度）
+# ══════════════════════════════════════════════════════════
+
+trigger_skill_improve() {
+  local question="$1" answer="$2"
+  # 只在涉及 lark-cli/缓存/飞书操作的对话后触发
+  echo "${answer}${question}" | grep -qiE \
+    "lark-cli|bitable|spreadsheet|飞书|cache|groups\.json|users\.json|tokens\.json|chat_id|open_id" \
+    || return 0
+  (
+    flock -n 200 || exit 0  # 已有改进任务在跑则跳过
+    local now; now=$(date +%s)
+    local last; last=$(stat -c %Y "$SKILL_IMPROVE_LOG" 2>/dev/null || echo 0)
+    (( now - last < 120 )) && exit 0  # 2 分钟内已改进过则跳过
+    echo "[$(date '+%H:%M:%S')] skill_improve: start" >> "$SKILL_IMPROVE_LOG"
+    local meta_prompt
+    meta_prompt="你是飞书Bot技能文档的维护者。以下是刚完成的一次对话：
+
+【用户问题】
+${question}
+
+【Bot回答（前600字）】
+${answer:0:600}
+
+请读取并检查这三个技能文件：
+- ~/.claude/skills/feishu-lark-cli/SKILL.md
+- ~/.claude/skills/feishu-cache/SKILL.md
+- ~/.claude/skills/feishu-file-ops/SKILL.md
+
+如果本次对话展示了未记录的 lark-cli 用法、新的错误处理方式、或对缓存的改进，请直接更新对应文件（只追加/修正，不删除已有内容，不改变格式）。否则输出 NO_UPDATE。"
+    $CLAUDE_BIN -p \
+      --dangerously-skip-permissions \
+      --mcp-config "$MCP_CONFIG" \
+      "$meta_prompt" < /dev/null >> "$SKILL_IMPROVE_LOG" 2>&1
+    echo "[$(date '+%H:%M:%S')] skill_improve: done" >> "$SKILL_IMPROVE_LOG"
+  ) 200>"$SKILL_IMPROVE_LOCK" &
+}
+
+# ══════════════════════════════════════════════════════════
+#  旧 cache.json 迁移（一次性，幂等）
+# ══════════════════════════════════════════════════════════
+
+migrate_old_cache() {
+  local old="$BOT_DIR/cache.json"
+  [[ ! -f "$old" ]] && return
+  log "迁移 cache.json → cache/ ..."
+  local now; now=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+
+  # 初始化 JSON 文件（不存在时）
+  [[ ! -f "$CACHE_DIR/tokens.json" ]] && \
+    echo '{"spreadsheets":{},"bitables":{},"wikis":{}}' > "$CACHE_DIR/tokens.json"
+  [[ ! -f "$CACHE_DIR/groups.json" ]] && echo '{}' > "$CACHE_DIR/groups.json"
+  [[ ! -f "$CACHE_DIR/users.json" ]]  && echo '{}' > "$CACHE_DIR/users.json"
+
+  # 迁移 spreadsheet_token
+  local sp_token; sp_token=$(jq -r '.spreadsheet_token // empty' "$old" 2>/dev/null)
+  if [[ -n "$sp_token" ]]; then
+    local sp_name; sp_name=$(jq -r '.spreadsheet_name // "MLA配置确认表"' "$old" 2>/dev/null)
+    (
+      flock -x 200
+      local cur; cur=$(cat "$CACHE_DIR/tokens.json")
+      echo "$cur" | jq \
+        --arg t "$sp_token" --arg n "$sp_name" --arg ts "$now" \
+        '.spreadsheets[$t] = {"name":$n,"updated_at":$ts}' \
+        > "$CACHE_DIR/tokens.json.tmp" \
+      && mv "$CACHE_DIR/tokens.json.tmp" "$CACHE_DIR/tokens.json"
+    ) 200>"$CACHE_DIR/tokens.lock"
+  fi
+
+  # 迁移 bitable tokens（格式：{"654":{"base_token":"...","table_id":"..."}}）
+  jq -r 'to_entries[] | select(.value.base_token?) |
+    "\(.key)|\(.value.base_token)|\(.value.table_id // "")"' \
+    "$old" 2>/dev/null | while IFS='|' read -r ver base_t table_t; do
+    [[ -z "$base_t" ]] && continue
+    (
+      flock -x 200
+      local cur; cur=$(cat "$CACHE_DIR/tokens.json")
+      local tables="{}"; [[ -n "$table_t" ]] && tables="{\"$table_t\":\"$ver\"}"
+      echo "$cur" | jq \
+        --arg t "$base_t" --arg n "版本${ver}" --argjson tb "$tables" --arg ts "$now" \
+        '.bitables[$t] = {"name":$n,"tables":$tb,"updated_at":$ts}' \
+        > "$CACHE_DIR/tokens.json.tmp" \
+      && mv "$CACHE_DIR/tokens.json.tmp" "$CACHE_DIR/tokens.json"
+    ) 200>"$CACHE_DIR/tokens.lock"
+  done
+
+  # 迁移 wiki_token
+  local wiki_token; wiki_token=$(jq -r '.wiki_token // empty' "$old" 2>/dev/null)
+  if [[ -n "$wiki_token" ]]; then
+    (
+      flock -x 200
+      local cur; cur=$(cat "$CACHE_DIR/tokens.json")
+      echo "$cur" | jq \
+        --arg t "$wiki_token" --arg ts "$now" \
+        '.wikis[$t] = {"name":"MLA知识库节点","updated_at":$ts}' \
+        > "$CACHE_DIR/tokens.json.tmp" \
+      && mv "$CACHE_DIR/tokens.json.tmp" "$CACHE_DIR/tokens.json"
+    ) 200>"$CACHE_DIR/tokens.lock"
+  fi
+
+  # 迁移 open_id → users.json
+  jq -r 'to_entries[] | select(.key | startswith("ou_")) | "\(.key)|\(.value)"' \
+    "$old" 2>/dev/null | while IFS='|' read -r oid name; do
+    [[ -z "$oid" ]] && continue
+    _write_users_json "$oid" "$name"
+  done
+
+  # 迁移 chat_id → groups.json
+  jq -r 'to_entries[] | select(.key | startswith("oc_")) | "\(.key)|\(.value)"' \
+    "$old" 2>/dev/null | while IFS='|' read -r cid name; do
+    [[ -z "$cid" ]] && continue
+    _write_groups_json "$cid" "$name"
+  done
+
+  mv "$old" "${old}.migrated"
+  log "cache.json 迁移完成 → cache.json.migrated"
 }
 
 # ══════════════════════════════════════════════════════════
@@ -466,6 +677,7 @@ event_loop() {
 
   log "启动监听 (PID $$)"
   build_warmup_session &
+  migrate_old_cache &
 
   declare -A processed_ids
 
