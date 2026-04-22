@@ -18,12 +18,12 @@
 ```
 飞书群消息（@ Bot）
 → lark-cli event +subscribe
-→ lark_sweet_bot.sh（会话管理 / 并发优化 / 卡片构建）
+→ Feishu_bot.sh（会话管理 / 并发优化 / 卡片构建）
 → Claude Code CLI --resume（带上下文调用）
 → lark-cli im +messages-send（卡片回复）
 ```
 
-**lark_sweet_bot.sh 关键特性**
+**Feishu_bot.sh 关键特性**
 
 | 特性 | 说明 |
 |------|------|
@@ -127,7 +127,7 @@ lark-cli auth login --as bot
 cp -r skills/feishu-* ~/.claude/skills/
 ```
 
-编辑 `lark_sweet_bot.sh` 顶部：
+编辑 `Feishu_bot.sh` 顶部：
 
 ```bash
 LARK=/path/to/lark-cli
@@ -143,9 +143,9 @@ MCP_CONFIG=/path/to/.claude/mcp.json
 ## 启动
 
 ```bash
-./lark_sweet_bot.sh start    # 后台启动
-./lark_sweet_bot.sh status   # 查看状态
-./lark_sweet_bot.sh stop     # 停止
+./Feishu_bot.sh start    # 后台启动
+./Feishu_bot.sh status   # 查看状态
+./Feishu_bot.sh stop     # 停止
 tail -f ~/feishu_bot/bot.log # 查看日志
 ```
 
