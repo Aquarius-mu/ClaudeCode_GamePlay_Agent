@@ -683,7 +683,7 @@ card = {
         {"tag": "div", "text": {"tag": "lark_md",
             "content": f"📅 **活动配置请跟进**\n{at_owners}\n麻烦配置活动，辛苦了！:THUMBSUP:"}},
         {"tag": "hr"},
-        {"tag": "div", "text": {"tag": "lark_md", "content": f"<font color=grey>:PROCESSING: {version} · {env} · 由 Claude Bot 自动发送</font>"}}
+        {"tag": "div", "text": {"tag": "lark_md", "content": f"<font color=grey>:DONE: {version} · {env} · 由 lucky后端ai 自动发送</font>"}}
     ]}
 }
 print(json.dumps(card, ensure_ascii=False))
